@@ -1,0 +1,136 @@
+name: Backend - test and deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  ECR_REPOSITORY: legalsight-vag-backend
+  ECS_CLUSTER: legalsight-vag
+  ECS_SERVICE: legalsight-vag-backend
+  ECS_TASK_FAMILY: legalsight-vag-backend
+  WORKER_SERVICE: legalsight-vag-worker
+  WORKER_TASK_FAMILY: legalsight-vag-worker
+  CONTAINER_NAME: backend
+
+jobs:
+  test:
+    name: Run pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - run: pip install -r requirements.txt
+      - run: python -m pytest -q
+
+  deploy:
+    name: Build image, migrate database, deploy API and worker
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - name: Require repository variables
+        env:
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          AWS_ROLE_ARN: ${{ vars.BACKEND_AWS_ROLE_ARN }}
+        run: |
+          for name in AWS_REGION AWS_ROLE_ARN; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Repository variable $name is not set"
+              exit 1
+            fi
+          done
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.BACKEND_AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      - uses: docker/setup-buildx-action@v4
+      - name: Build and push image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Fetch current API task definition
+        run: aws ecs describe-task-definition --task-definition "$ECS_TASK_FAMILY" --query taskDefinition > api-task-definition.json
+      - name: Render API task definition
+        id: render-api
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: api-task-definition.json
+          container-name: backend
+          image: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+      - name: Fetch current worker task definition
+        run: aws ecs describe-task-definition --task-definition "$WORKER_TASK_FAMILY" --query taskDefinition > worker-task-definition.json
+      - name: Render worker task definition
+        id: render-worker
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: worker-task-definition.json
+          container-name: worker
+          image: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+      - name: Migrate database
+        env:
+          TASK_DEFINITION_FILE: ${{ steps.render-api.outputs.task-definition }}
+        run: |
+          SUBNETS=$(aws cloudformation describe-stacks --stack-name "$ECS_CLUSTER" \
+            --query "Stacks[0].Outputs[?OutputKey=='PublicSubnetIds'].OutputValue" --output text)
+          SECURITY_GROUP=$(aws cloudformation describe-stacks --stack-name "$ECS_CLUSTER" \
+            --query "Stacks[0].Outputs[?OutputKey=='BackendTaskSecurityGroupId'].OutputValue" --output text)
+          TASK_DEFINITION_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "file://$TASK_DEFINITION_FILE" \
+            --query taskDefinition.taskDefinitionArn --output text)
+          TASK_ARN=$(aws ecs run-task --cluster "$ECS_CLUSTER" \
+            --task-definition "$TASK_DEFINITION_ARN" --launch-type FARGATE --count 1 \
+            --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SECURITY_GROUP],assignPublicIp=ENABLED}" \
+            --overrides '{"containerOverrides":[{"name":"backend","command":["alembic","upgrade","head"]}]}' \
+            --query 'tasks[0].taskArn' --output text)
+          aws ecs wait tasks-stopped --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN"
+          EXIT_CODE=$(aws ecs describe-tasks --cluster "$ECS_CLUSTER" --tasks "$TASK_ARN" \
+            --query 'tasks[0].containers[0].exitCode' --output text)
+          if [ "$EXIT_CODE" != "0" ]; then
+            echo "::error::Database migration task exited with code $EXIT_CODE"
+            exit 1
+          fi
+      - name: Deploy API to Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-api.outputs.task-definition }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          wait-for-service-stability: true
+          wait-for-minutes: 15
+      - name: Deploy worker to Amazon ECS
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-worker.outputs.task-definition }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.WORKER_SERVICE }}
+          wait-for-service-stability: true
+          wait-for-minutes: 15
